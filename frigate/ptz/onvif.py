@@ -4,10 +4,11 @@ import asyncio
 import logging
 import threading
 import time
+import requests
 from enum import Enum
 from importlib.util import find_spec
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy
 from onvif import ONVIFCamera, ONVIFError, ONVIFService
@@ -36,6 +37,55 @@ class OnvifCommandEnum(str, Enum):
     focus_in = "focus_in"
     focus_out = "focus_out"
 
+class ApiPTZController:
+    def __init__(self, config: dict) -> None:
+        self.host = config.get("host")
+        self.port = config.get("port", 80)
+        self.user = config.get("user")
+        self.password = config.get("password")
+        self.base_url = f"http://{self.host}:{self.port}/digest/frmPTZControl"
+        self.session = requests.Session()
+        self.auth = HTTPDigestAuth(self.user, self.password)
+        self.session.headers.update({
+            'User-Agent': 'curl/4.7.1',  # Required by the API
+            'Content-Type': 'application/json; charset=utf-8',
+            'Accept-Encoding': 'gzip'
+        })
+
+    def _map_api_command(self, cmd: int) -> Optional[OnvifCommandEnum]:
+        """Map API command codes to OnvifCommandEnum."""
+        command_map = {
+            11: OnvifCommandEnum.zoom_in,      # 缩放+
+            12: OnvifCommandEnum.zoom_out,     # 缩放-
+            13: OnvifCommandEnum.focus_in,     # 聚焦+
+            14: OnvifCommandEnum.focus_out,    # 聚焦-
+            21: OnvifCommandEnum.move_up,      # 上
+            22: OnvifCommandEnum.move_down,    # 下
+            23: OnvifCommandEnum.move_left,    # 左
+            24: OnvifCommandEnum.move_right,   # 右
+        }
+        return command_map.get(cmd)
+
+    def _send_command(self, cmd: int, is_stop: int, speed: int) -> bool:
+        """Send a single API PTZ command."""
+        data = {
+            "Type": 1,
+            "Ch": 1,
+            "Dev": 1,
+            "Data": {
+                "Cmd": cmd,
+                "IsStop": is_stop,
+                "Speed": speed
+            }
+        }
+        try:
+            response = self.session.post(self.base_url, json=data, auth=self.auth)
+            response.raise_for_status()
+            logger.debug(f"API PTZ command sent successfully: cmd={cmd}, is_stop={is_stop}")
+            return True
+        except requests.RequestException as e:
+            logger.error(f"Failed to send API PTZ command (cmd={cmd}, is_stop={is_stop}): {e}")
+            return False
 
 class OnvifController:
     ptz_metrics: dict[str, PTZMetrics]
@@ -49,6 +99,7 @@ class OnvifController:
         self.reset_timeout = 900  # 15 minutes
         self.config = config
         self.ptz_metrics = ptz_metrics
+        self.api_controllers: dict[str, ApiPTZController] = {}
 
         self.status_locks: dict[str, asyncio.Lock] = {}
 
@@ -64,6 +115,15 @@ class OnvifController:
             if cam.onvif.host:
                 self.camera_configs[cam_name] = cam
                 self.status_locks[cam_name] = asyncio.Lock()
+                if getattr(cam.onvif, 'api_ptz', False):
+                    self.api_controllers[cam_name] = ApiPTZController({
+                        'host': cam.onvif.host,
+                        'port': cam.onvif.port,
+                        'user': cam.onvif.user,
+                        'password': cam.onvif.password
+                    })
+            else:
+                logger.warning(f"No PTZ configuration found for camera {cam_name}")
 
         asyncio.run_coroutine_threadsafe(self._init_cameras(), self.loop)
 
@@ -705,20 +765,38 @@ class OnvifController:
         """
         Handle ONVIF commands by scheduling them in the event loop.
         """
-        future = asyncio.run_coroutine_threadsafe(
-            self.handle_command_async(camera_name, command, param), self.loop
-        )
+        if camera_name not in self.cams and camera_name not in self.api_controllers:
+            logger.error(f"PTZ is not configured for {camera_name}")
+            return
 
-        try:
-            # Wait with a timeout to prevent blocking indefinitely
-            future.result(timeout=10)
-        except asyncio.TimeoutError:
-            logger.error(f"Command {command} timed out for camera {camera_name}")
-        except Exception as e:
-            logger.error(
-                f"Error executing command {command} for camera {camera_name}: {e}"
+        if camera_name in self.api_controllers:
+            # Handle API-based PTZ command
+            api_cmd = {
+                OnvifCommandEnum.move_up: 21,
+                OnvifCommandEnum.move_down: 22,
+                OnvifCommandEnum.move_left: 23,
+                OnvifCommandEnum.move_right: 24,
+                OnvifCommandEnum.zoom_in: 11,
+                OnvifCommandEnum.zoom_out: 12,
+                OnvifCommandEnum.focus_in: 13,
+                OnvifCommandEnum.focus_out: 14,
+                # OnvifCommandEnum.stop: 25  # Using move_up_left as a stop command; adjust if needed
+            }.get(command, None)
+            if api_cmd is None:
+                logger.debug(f"Ignoring unsupported command: {command}")
+                return
+            self.api_controllers[camera_name].handle_command(api_cmd, 0 if command != OnvifCommandEnum.stop else 1, 5)
+        else:
+            # Handle ONVIF-based PTZ command
+            future = asyncio.run_coroutine_threadsafe(
+                self.handle_command_async(camera_name, command, param), self.loop
             )
-
+            try:
+                future.result(timeout=10)
+            except asyncio.TimeoutError:
+                logger.error(f"Command {command} timed out for camera {camera_name}")
+            except Exception as e:
+                logger.error(f"Error executing command {command} for camera {camera_name}: {e}")
     async def get_camera_info(self, camera_name: str) -> dict[str, Any]:
         """
         Get ptz capabilities and presets, attempting to reconnect if ONVIF is configured
